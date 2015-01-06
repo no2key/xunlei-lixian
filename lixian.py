@@ -10,6 +10,7 @@ import os.path
 import json
 from ast import literal_eval
 
+USER_AGENT = 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:11.0) Gecko/20100101 Firefox/11.0'
 
 def retry(f_or_arg, *args):
 	#retry_sleeps = [1, 1, 1]
@@ -251,7 +252,7 @@ class XunleiClient(object):
 		headers = args['headers']
 		headers.setdefault('Accept-Encoding', 'gzip, deflate')
 #		headers.setdefault('Referer', 'http://lixian.vip.xunlei.com/task.html')
-#		headers.setdefault('User-Agent', 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:11.0) Gecko/20100101 Firefox/11.0')
+		headers.setdefault('User-Agent', USER_AGENT)
 #		headers.setdefault('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8')
 #		headers.setdefault('Accept-Language', 'zh-cn,zh;q=0.7,en-us;q=0.3')
 		response = self.urlopen(url, **args)
@@ -357,7 +358,7 @@ class XunleiClient(object):
 		if not self.verification_code_reader:
 			raise NotImplementedError('Verification code required')
 		else:
-			verification_code_url = 'http://verify2.xunlei.com/image?cachetime=%s' % current_timestamp()
+			verification_code_url = 'http://verify2.xunlei.com/image?t=MVA&cachetime=%s' % current_timestamp()
 			image = self.urlopen(verification_code_url).read()
 			return self.verification_code_reader(image)
 
@@ -387,10 +388,12 @@ class XunleiClient(object):
 		assert verification_code
 		password = encypt_password(password)
 		password = md5(password+verification_code)
-		login_page = self.urlopen('http://login.xunlei.com/sec2login/', data={'u': username, 'p': password, 'verifycode': verification_code})
+		login_page = self.urlopen('http://login.xunlei.com/sec2login/', headers={ 'User-Agent': USER_AGENT}, data={'u': username, 'p': password, 'verifycode': verification_code})
+		#login_page = self.urlopen('http://login.xunlei.com/sec2login/', data={'u': username, 'p': password, 'verifycode': verification_code})
 		self.id = self.get_userid()
 		with self.attr(page_size=1):
-			login_page = self.urlopen('http://dynamic.lixian.vip.xunlei.com/login?cachetime=%d&from=0'%current_timestamp()).read()
+			login_page = self.urlopen('http://dynamic.lixian.vip.xunlei.com/login?cachetime=%d&from=0'%current_timestamp(), headers={ 'User-Agent': USER_AGENT}).read()
+			#login_page = self.urlopen('http://dynamic.lixian.vip.xunlei.com/login?cachetime=%d&from=0'%current_timestamp()).read()
 		if not self.is_login_ok(login_page):
 			logger.trace(login_page)
 			raise RuntimeError('login failed')
@@ -681,29 +684,43 @@ class XunleiClient(object):
 		data['verify_code'] = ''
 		response = self.urlread(url, data=data)
 
-		code = get_response_code(response, jsonp)
+		response_info = get_response_info(response, jsonp)
+		code = response_info['process']
 		while code == -12 or code == -11:
 			verification_code = self.read_verification_code()
 			assert verification_code
 			data['verify_code'] = verification_code
 			response = self.urlread(url, data=data)
-			code = get_response_code(response, jsonp)
+			response_info = get_response_info(response, jsonp)
+			code = response_info['process']
 		if code == len(urls):
 			return
 		else:
+			msg = response_info.get('msg')
+			assert not msg, repr(msg.decode('utf-8'))
 			assert code == len(urls), 'invalid response code: %s' % code
 
 	def commit_torrent_task(self, data):
 		jsonp = 'jsonp%s' % current_timestamp()
 		commit_url = 'http://dynamic.cloud.vip.xunlei.com/interface/bt_task_commit?callback=%s' % jsonp
-		response = self.urlread(commit_url, data=data)
-		code = get_response_code(response, jsonp)['progress']
-		while code == -12 or code == -11:
-			verification_code = self.read_verification_code()
-			assert verification_code
-			data['verify_code'] = verification_code
+		def commit():
 			response = self.urlread(commit_url, data=data)
-			code = get_response_code(response, jsonp)['progress']
+			response_info = get_response_info(response, jsonp)
+			code = response_info['progress']
+			while code == -12 or code == -11:
+				verification_code = self.read_verification_code()
+				assert verification_code
+				data['verify_code'] = verification_code
+				response = self.urlread(commit_url, data=data)
+				response_info = get_response_info(response, jsonp)
+				code = response_info['progress']
+			return response_info
+		response_info = commit()
+		if is_dirty_resource(response_info):
+			data['btname'] = encode_dirty_name(data['btname'])
+			response_info = commit()
+		msg = response_info.get('msg')
+		assert not msg, repr(msg)
 
 	def add_torrent_task_by_content(self, content, path='attachment.torrent'):
 		assert re.match(r'd\d+:', content), 'Probably not a valid content file [%s...]' % repr(content[:17])
@@ -730,17 +747,12 @@ class XunleiClient(object):
 			return bt_hash
 		raise NotImplementedError(response)
 
-	def add_torrent_task_by_info_hash(self, sha1):
-		return self.add_torrent_task_by_content(self.get_torrent_file_by_info_hash(sha1), sha1.upper()+'.torrent')
-
 	def add_torrent_task(self, path):
 		with open(path, 'rb') as x:
 			return self.add_torrent_task_by_content(x.read(), os.path.basename(path))
 
-	def add_torrent_task_by_info_hash2(self, sha1, old_task_id=None):
-		'''similar to add_torrent_task_by_info_hash, but faster. I may delete current add_torrent_task_by_info_hash completely in future'''
-		link = 'http://dynamic.cloud.vip.xunlei.com/interface/get_torrent?userid=%s&infoid=%s' % (self.id, sha1.upper())
-		return self.add_torrent_task_by_link(link, old_task_id=old_task_id)
+	def add_torrent_task_by_info_hash(self, sha1, old_task_id=None):
+		return self.add_magnet_task('magnet:?xt=urn:btih:' + sha1.upper())
 
 	def add_magnet_task(self, link):
 		return self.add_torrent_task_by_link(link)
@@ -756,7 +768,7 @@ class XunleiClient(object):
 			raise NotImplementedError(repr(response))
 		args = success.group(1).decode('utf-8')
 		args = literal_eval(args.replace('new Array', ''))
-		_, cid, tsize, btname, _, names, sizes_, sizes, _, types, findexes, timestamp, _ = args
+		_, cid, tsize, btname, _, names, sizes_, sizes, _, types, findexes, _, timestamp, _ = args
 		def toList(x):
 			if type(x) in (list, tuple):
 				return x
@@ -853,9 +865,10 @@ def current_random():
 
 def convert_task(data):
 	expired = {'0':False, '4': True}[data['flag']]
+	assert re.match(r'[^:]+', data['url']), 'Invalid URL in: ' + repr(data)
 	task = {'id': data['id'],
 			'type': re.match(r'[^:]+', data['url']).group().lower(),
-			'name': unescape_html(data['taskname']),
+			'name': decode_dirty_name(unescape_html(data['taskname'])),
 			'status': int(data['download_status']),
 			'status_text': {'0':'waiting', '1':'downloading', '2':'completed', '3':'failed', '5':'pending'}[data['download_status']],
 			'expired': expired,
@@ -1005,11 +1018,17 @@ def assert_response(response, jsonp, value=1):
 	response = remove_bom(response)
 	assert response == '%s(%s)' % (jsonp, value), repr(response)
 
-def get_response_code(response, jsonp):
+def get_response_info(response, jsonp):
 	response = remove_bom(response)
 	m = re.match(r'^%s\((.+)\)$' % jsonp, response)
 	assert m, 'invalid jsonp response: %s' % response
-	return json.loads(m.group(1))
+	logger.trace('get_response_info')
+	logger.trace(response)
+	parameter = m.group(1)
+	m = re.match(r"^\{process:(-?\d+),msg:'(.*)'\}$", parameter)
+	if m:
+		return {'process': int(m.group(1)), 'msg': m.group(2)}
+	return json.loads(parameter)
 
 def parse_url_protocol(url):
 	m = re.match(r'([^:]+)://', url)
@@ -1050,4 +1069,23 @@ def undeflate(s):
 	import zlib
 	return zlib.decompress(s, -zlib.MAX_WBITS)
 
+def is_dirty_resource(response_info):
+	return response_info['progress'] == 2 and response_info.get('rtcode') == '76' and response_info.get('msg') == u"\u6587\u4ef6\u540d\u4e2d\u5305\u542b\u8fdd\u89c4\u5185\u5bb9\uff0c\u65e0\u6cd5\u6dfb\u52a0\u5230\u79bb\u7ebf\u7a7a\u95f4[0976]"
+
+def encode_dirty_name(x):
+	import base64
+	try:
+		return unicode('[base64]' + base64.encodestring(x.encode('utf-8')).replace('\n', ''))
+	except:
+		return x
+
+def decode_dirty_name(x):
+	import base64
+	try:
+		if x.startswith('[base64]'):
+			return base64.decodestring(x[len('[base64]'):]).decode('utf-8')
+		else:
+			return x
+	except:
+		return x
 
